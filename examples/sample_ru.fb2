@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<FictionBook xmlns="http://www.gribuser.ru/xml/fictionbook/2.0">
+  <description><title-info><genre>sf</genre><author><first-name>AIBook</first-name></author><book-title>Проверка аудиокниги</book-title><lang>ru</lang></title-info></description>
+  <body><section><title><p>Глава первая. Новая книга</p></title>
+    <p>Утром он открыл новую книгу. За окном шумел дождь, а в комнате было тепло и тихо. История начиналась с далёкого путешествия.</p>
+    <p>На следующей странице появилась карта. Дорога вела через лес к небольшому городу у моря. Путешествие только начиналось.</p>
+  </section></body>
+</FictionBook>

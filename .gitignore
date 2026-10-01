@@ -1,0 +1,15 @@
+.venv/
+.voice-venv/
+.cache/
+data/
+dist/
+vendor/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+outputs/
+*.aibook.tmp.wav
+*.wav
+*.mp3
+.ruff_cache/
+*.part

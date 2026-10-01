@@ -1,0 +1,6 @@
+.
+Lib
+DLLs
+Lib\site-packages
+..\..\app
+import site

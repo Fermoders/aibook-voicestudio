@@ -1,0 +1,128 @@
+from __future__ import annotations
+
+import hashlib
+import os
+import subprocess
+import tempfile
+import threading
+import unittest
+import zipfile
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+
+INSTALLER = Path(__file__).resolve().parent.parent / "install-windows.ps1"
+POWERSHELL = Path(os.environ.get("WINDIR", "C:/Windows")) / "System32/WindowsPowerShell/v1.0/powershell.exe"
+
+
+def ps_literal(value):
+    return "'" + str(value).replace("'", "''") + "'"
+
+
+@unittest.skipUnless(os.name == "nt" and POWERSHELL.is_file(), "Windows PowerShell is required")
+class WindowsInstallerTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary.name)
+
+    def tearDown(self):
+        self.temporary.cleanup()
+
+    def run_functions(self, body):
+        script = (
+            "$ErrorActionPreference = 'Stop'; $tokens = $null; $errors = $null; "
+            f"$ast = [Management.Automation.Language.Parser]::ParseFile({ps_literal(INSTALLER)}, [ref]$tokens, [ref]$errors); "
+            "if ($errors.Count) { throw $errors[0].Message }; "
+            "$functions = $ast.FindAll({param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst]}, $true); "
+            "foreach ($function in $functions) { . ([scriptblock]::Create($function.Extent.Text)) }; "
+            "Initialize-InstallerModules; "
+            + body
+        )
+        result = subprocess.run(
+            [str(POWERSHELL), "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script],
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=45,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_installer_parses_on_windows_powershell_51(self):
+        self.run_functions("Write-Output 'Parsed on Windows PowerShell 5.1.'")
+
+    def test_safe_paths_reject_escape_and_absolute_windows_paths(self):
+        self.run_functions(
+            f"$root = {ps_literal(self.root)}; "
+            "foreach ($path in @('../escape', 'C:/escape', '/escape', 'app/../escape', 'app\\escape')) { "
+            "$rejected = $false; try { [void](Get-SafeChildPath $root $path) } catch { $rejected = $true }; "
+            "if (-not $rejected) { throw 'Unsafe path accepted' } }; "
+            "[void](Get-SafeChildPath $root 'app/main.py')"
+        )
+
+    def test_checksum_rejects_corrupt_cache(self):
+        path = self.root / "asset.bin"
+        path.write_bytes(b"valid")
+        digest = hashlib.sha256(b"valid").hexdigest()
+        self.run_functions(
+            f"$path = {ps_literal(path)}; "
+            f"if (-not (Test-VerifiedFile $path 5 '{digest}')) {{ throw 'Valid asset rejected' }}; "
+            f"if (Test-VerifiedFile $path 5 ('0' * 64)) {{ throw 'Corrupt asset accepted' }}"
+        )
+
+    def test_archive_cannot_write_outside_the_staging_directory(self):
+        path = self.root / "bad.zip"
+        with zipfile.ZipFile(path, "w") as archive:
+            archive.writestr("../escape.txt", b"x")
+        stage = self.root / "stage"
+        stage.mkdir()
+        self.run_functions(
+            "Add-Type -AssemblyName System.IO.Compression.FileSystem; "
+            "$ExpectedFiles = @{'../escape.txt' = [pscustomobject]@{size = 1}}; "
+            "$rejected = $false; "
+            f"try {{ Expand-VerifiedArchive {ps_literal(path)} {ps_literal(stage)} }} catch {{ $rejected = $true }}; "
+            "if (-not $rejected) { throw 'Archive escape accepted' }"
+        )
+        self.assertFalse((self.root / "escape.txt").exists())
+
+    def test_interrupted_download_resumes_and_verifies_full_sha256(self):
+        data = bytes(range(256)) * 256
+        ranges = []
+        lock = threading.Lock()
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                offset = 0
+                header = self.headers.get("Range")
+                if header:
+                    offset = int(header.removeprefix("bytes=").split("-")[0])
+                with lock:
+                    ranges.append(offset)
+                self.send_response(206 if offset else 200)
+                self.send_header("Content-Length", str(len(data) - offset))
+                if offset:
+                    self.send_header("Content-Range", f"bytes {offset}-{len(data) - 1}/{len(data)}")
+                self.end_headers()
+                self.wfile.write(data[offset:])
+
+            def log_message(self, *_args):
+                pass
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, name="installer-test-http")
+        thread.start()
+        path = self.root / "asset.bin"
+        path.with_suffix(".bin.part").write_bytes(data[:1024])
+        try:
+            self.run_functions(
+                "Add-Type -AssemblyName System.Net.Http; "
+                "$handler = [Net.Http.HttpClientHandler]::new(); $handler.UseProxy = $false; "
+                "$http = [Net.Http.HttpClient]::new($handler); "
+                f"try {{ Get-RemoteFile 'http://127.0.0.1:{server.server_port}/asset' {ps_literal(path)} {len(data)} '{hashlib.sha256(data).hexdigest()}' }} "
+                "finally { $http.Dispose() }"
+            )
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+        self.assertEqual(path.read_bytes(), data)
+        self.assertEqual(ranges, [1024])
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -1,0 +1,20 @@
+AIBook VoiceStudio uses the unmodified OmniVoice model library from
+debpalash/VoiceStudio v0.5.6 (3915a62cb482bb43117aaebab57d22745bd1cc21).
+VoiceStudio: Copyright 2024-present Palash Debnath and contributors, AGPL-3.0.
+OmniVoice library: Copyright 2026 Xiaomi Corp. (Han Zhu), Apache-2.0.
+OmniVoice pretrained weights: CC-BY-NC, as stated in the included model card.
+VoiceStudio logo: from the upstream project; used as the engine attribution.
+
+Built with Higgs Materials licensed from Boson AI USA, Inc., Copyright Boson
+AI USA, Inc., All Rights Reserved and Meta Llama 3 licensed under the Meta
+Llama 3 Community License, Copyright Meta Platforms, Inc., All Rights Reserved.
+Meta Llama 3 is licensed under the Meta Llama 3 Community License,
+Copyright Meta Platforms, Inc. All Rights Reserved.
+Boson Higgs Audio 2 is licensed under the Boson Community License,
+Copyright Boson AI USA, Inc. All Rights Reserved.
+
+Original licenses, notices and model cards remain bundled with their assets.
+
+Local word alignment uses Whisper tiny and openai-whisper (MIT) through
+stable-ts (MIT). Streaming audio playback uses pyminiaudio (MIT).
+Toolbar icons are rendered from Lucide Static 0.468.0 (ISC).
