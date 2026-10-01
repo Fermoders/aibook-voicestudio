@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import tempfile
+import time
 import unittest
 import zipfile
 from pathlib import Path
@@ -30,7 +31,14 @@ class WindowsReleaseTests(unittest.TestCase):
         self.output = self.directory / "release"
 
     def tearDown(self):
-        self.temporary.cleanup()
+        for attempt in range(6):
+            try:
+                self.temporary.cleanup()
+                return
+            except OSError as error:
+                if getattr(error, "winerror", None) not in {32, 145} or attempt == 5:
+                    raise
+                time.sleep(0.1 * (attempt + 1))
 
     def add(self, name, data=b"test"):
         path = self.root / name

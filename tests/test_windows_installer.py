@@ -40,6 +40,7 @@ class WindowsInstallerTests(unittest.TestCase):
         result = subprocess.run(
             [str(POWERSHELL), "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script],
             capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=45,
+            check=False,
         )
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 

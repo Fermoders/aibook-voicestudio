@@ -162,8 +162,8 @@ def build_release(
         if packages is None:
             result = subprocess.run(
                 [str(root / "runtime/python/python.exe"), "-I", "-c",
-                 "import importlib.metadata as m, json; "
-                 "print(json.dumps({d.metadata['Name']: d.version for d in m.distributions()}))"],
+                 ("import importlib.metadata as m, json; "
+                  "print(json.dumps({d.metadata['Name']: d.version for d in m.distributions()}))")],
                 check=True, text=True, capture_output=True, timeout=60,
             )
             packages = json.loads(result.stdout)

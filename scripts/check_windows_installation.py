@@ -3,12 +3,12 @@ from __future__ import annotations
 import argparse
 import hashlib
 import importlib
-import importlib.metadata as metadata
 import json
 import os
 import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor
+from importlib import metadata
 from pathlib import Path, PurePosixPath
 
 
@@ -64,10 +64,12 @@ def check_dependencies(root: Path, manifest: dict) -> dict:
         importlib.import_module(name)
     sys.path.insert(0, str(root / "app/vendor/VoiceStudio"))
     importlib.import_module("omnivoice")
-    import torch
     import tkinter as tk
+
     import miniaudio
+    import torch
     import whisper
+
     from aibook.voice_studio_config import model_ready
 
     window = tk.Tk()
