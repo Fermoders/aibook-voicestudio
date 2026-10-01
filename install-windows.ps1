@@ -406,26 +406,33 @@ try {
         Start-Process -FilePath (Join-Path $target 'AIBook VoiceStudio.exe') -WindowStyle Hidden
     }
 } finally {
-    if (-not $published -and $stage) {
-        if ($backup -and (Test-Path -LiteralPath $backup) -and -not (Test-Path -LiteralPath $target)) {
-            Move-Item -LiteralPath $backup -Destination $target
-        }
-        foreach ($relative in $movedData) {
-            $source = Get-SafeChildPath $stage $relative
-            if (Test-Path -LiteralPath $source) {
-                $destination = Get-SafeChildPath $target $relative
-                [void][IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($destination))
-                Move-Item -LiteralPath $source -Destination $destination
+    try {
+        if (-not $published -and $stage) {
+            if ($backup -and (Test-Path -LiteralPath $backup) -and -not (Test-Path -LiteralPath $target)) {
+                Move-Item -LiteralPath $backup -Destination $target
+            }
+            foreach ($relative in $movedData) {
+                $source = Get-SafeChildPath $stage $relative
+                if (Test-Path -LiteralPath $source) {
+                    $destination = Get-SafeChildPath $target $relative
+                    [void][IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($destination))
+                    Move-Item -LiteralPath $source -Destination $destination
+                }
+            }
+            $resolvedStage = [IO.Path]::GetFullPath($stage)
+            if ([IO.Path]::GetDirectoryName($resolvedStage) -eq $parent -and [IO.Path]::GetFileName($resolvedStage) -match '^\.aibook-stage-[0-9a-f]{10}$' -and (Test-Path -LiteralPath $resolvedStage)) {
+                Remove-Item -LiteralPath $resolvedStage -Recurse -Force
             }
         }
-        $resolvedStage = [IO.Path]::GetFullPath($stage)
-        if ([IO.Path]::GetDirectoryName($resolvedStage) -eq $parent -and [IO.Path]::GetFileName($resolvedStage) -match '^\.aibook-stage-[0-9a-f]{10}$' -and (Test-Path -LiteralPath $resolvedStage)) {
-            Remove-Item -LiteralPath $resolvedStage -Recurse -Force
+    } finally {
+        foreach ($cleanup in @(
+            { if ($http) { $http.Dispose() } },
+            { if ($appAcquired) { $appMutex.ReleaseMutex() } },
+            { if ($appMutex) { $appMutex.Dispose() } },
+            { if ($acquired) { $mutex.ReleaseMutex() } },
+            { $mutex.Dispose() }
+        )) {
+            try { & $cleanup } catch { Write-Warning ("Installer resource cleanup failed: " + $_.Exception.GetType().Name) }
         }
     }
-    if ($http) { $http.Dispose() }
-    if ($appAcquired) { $appMutex.ReleaseMutex() }
-    if ($appMutex) { $appMutex.Dispose() }
-    if ($acquired) { $mutex.ReleaseMutex() }
-    $mutex.Dispose()
 }

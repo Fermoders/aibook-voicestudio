@@ -21,7 +21,8 @@ class PortablePathTests(unittest.TestCase):
                 decoded = decode_portable_path(encoded)
 
             self.assertEqual(encoded, "$AIBOOK_ROOT$/outputs/book.wav")
-            self.assertEqual(decoded, second_root / "outputs" / "book.wav")
+            expected = second_root.resolve(strict=False) / "outputs" / "book.wav"
+            self.assertEqual(decoded, expected)
 
     def test_external_path_stays_absolute(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

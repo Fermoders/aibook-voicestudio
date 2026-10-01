@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import subprocess
 import tempfile
@@ -123,6 +124,50 @@ class WindowsInstallerTests(unittest.TestCase):
             thread.join(timeout=5)
         self.assertEqual(path.read_bytes(), data)
         self.assertEqual(ranges, [1024])
+
+    def test_failed_stage_cleanup_cannot_leave_installer_mutexes_locked(self):
+        cache = self.root / "cache"
+        cache.mkdir()
+        asset = cache / "windows-01.zip"
+        with zipfile.ZipFile(asset, "w") as archive:
+            archive.writestr("unexpected.txt", b"x")
+        manifest = cache / "manifest.json"
+        files = [
+            {"path": name, "size": 1, "sha256": hashlib.sha256(b"x").hexdigest()}
+            for name in (
+                "runtime/python/python.exe", "AIBook VoiceStudio.exe",
+                "source/scripts/check_windows_installation.py",
+            )
+        ]
+        manifest.write_text(json.dumps({
+            "schema": 1, "application": "AIBookVoiceStudio", "version": "1.1.0",
+            "repository": "Fermoders/aibook-voicestudio", "tag": "v1.1.0",
+            "platform": "windows-x64", "source_commit": "a" * 40,
+            "installed_bytes": 3, "download_bytes": asset.stat().st_size,
+            "packages": {"torch": "2.8.0"}, "joins": [], "files": files,
+            "assets": [{"name": asset.name, "kind": "zip", "size": asset.stat().st_size,
+                        "sha256": hashlib.sha256(asset.read_bytes()).hexdigest()}],
+        }), encoding="utf-8")
+        target = self.root / "installed"
+        identity = hashlib.sha256(str(target).lower().encode()).hexdigest().upper()
+        child = (
+            "foreach ($name in @('Local\\AIBookVoiceStudioInstaller', "
+            f"'Local\\AIBookVoiceStudio_{identity}')) {{ "
+            "$mutex = [Threading.Mutex]::new($false, $name); "
+            "if (-not $mutex.WaitOne(0)) { throw 'Installer leaked a mutex' }; "
+            "$mutex.ReleaseMutex(); $mutex.Dispose() }"
+        )
+        self.run_functions(
+            "function Remove-Item { param([string]$LiteralPath, [switch]$Recurse, [switch]$Force) "
+            "if ($LiteralPath -match '\\.aibook-stage-') { throw 'Controlled stage-cleanup failure' }; "
+            "Microsoft.PowerShell.Management\\Remove-Item @PSBoundParameters }; "
+            "$failed = $false; "
+            f"try {{ & {ps_literal(INSTALLER)} -InstallDir {ps_literal(target)} "
+            f"-CacheDir {ps_literal(cache)} -ManifestPath {ps_literal(manifest)} -NoLaunch -NoShortcut -KeepDownloads }} "
+            "catch { $failed = $true }; if (-not $failed) { throw 'Invalid archive accepted' }; "
+            f"& {ps_literal(POWERSHELL)} -NoProfile -Command {ps_literal(child)}; "
+            "if ($LASTEXITCODE) { throw 'Resource-release assertion failed' }"
+        )
 
 
 if __name__ == "__main__":
