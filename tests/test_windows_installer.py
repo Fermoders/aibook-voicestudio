@@ -252,8 +252,8 @@ class WindowsInstallerTests(unittest.TestCase):
             )
         ]
         manifest.write_text(json.dumps({
-            "schema": 1, "application": "AIBookVoiceStudio", "version": "1.1.0",
-            "repository": "Fermoders/aibook-voicestudio", "tag": "v1.1.0",
+            "schema": 1, "application": "AIBookVoiceStudio", "version": "1.2.0",
+            "repository": "Fermoders/aibook-voicestudio", "tag": "v1.2.0",
             "platform": "windows-x64", "source_commit": "a" * 40,
             "installed_bytes": 3, "download_bytes": asset.stat().st_size,
             "packages": {"torch": "2.8.0"}, "joins": [], "files": files,

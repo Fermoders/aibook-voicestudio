@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import gc
+import io
 import json
 import os
 import re
@@ -21,12 +22,14 @@ from .voice_studio_config import (
 
 
 class StudioWorker:
-    def __init__(self, send: Any) -> None:
+    def __init__(self, send: Any, send_audio: Any = None) -> None:
         self.send = send
+        self.send_audio = send_audio
         self.model: Any = None
         self.device: str | None = None
         self.prompts: dict[str, Any] = {}
         self._fallback_cpu = False
+        self.aligner: Any = None
 
     def load(self, preference: str) -> None:
         import torch
@@ -169,7 +172,7 @@ class StudioWorker:
             }
         )
         result = self.model.generate(
-            text=request["text"],
+            text=" ".join(request["text"].split()),
             language="Russian",
             voice_clone_prompt=prompt,
             speed=float(request["speed"]),
@@ -182,6 +185,31 @@ class StudioWorker:
             or float(np.max(np.abs(samples))) < 1e-6
         ):
             raise RuntimeError("OmniVoice создал пустой, тихий или повреждённый звук")
+        if request["op"] == "synthesize_buffer":
+            from dataclasses import asdict
+
+            from .audio import render_buffer
+
+            audio = render_buffer(
+                samples,
+                int(self.model.sampling_rate),
+                pause_ms=int(request.get("pause_ms", 0)),
+                volume_db=float(request.get("volume_db", 0)),
+                pitch_semitones=float(request.get("pitch_semitones", 0)),
+                playback_speed=float(request.get("playback_speed", 1)),
+            )
+            words = self.align_buffer(audio, request["text"])
+            self.send_audio(
+                {
+                    "op": "audio_buffer",
+                    "device": self.device,
+                    "duration": sf.info(io.BytesIO(audio)).duration,
+                    "words": [asdict(word) for word in words],
+                    "size": len(audio),
+                },
+                audio,
+            )
+            return
         output = Path(request["output"])
         output.parent.mkdir(parents=True, exist_ok=True)
         sf.write(
@@ -192,6 +220,40 @@ class StudioWorker:
             format="WAV",
         )
         self.send({"op": "audio", "device": self.device, "output": str(output)})
+
+    def align_buffer(self, audio: bytes, source: str):
+        import soundfile as sf
+        import stable_whisper
+        import torch
+        import torchaudio
+
+        from .timeline import map_alignment
+
+        if self.aligner is None:
+            checkpoint = studio_model_dir().parent / "Whisper" / "tiny.pt"
+            self.aligner = stable_whisper.load_model(str(checkpoint), device="cpu")
+        samples, rate = sf.read(io.BytesIO(audio), dtype="float32")
+        tensor = torch.from_numpy(samples)
+        if rate != 16000:
+            tensor = torchaudio.functional.resample(tensor, rate, 16000)
+        aligned = self.aligner.align(
+            tensor.numpy(),
+            " ".join(source.split()),
+            language="ru",
+            verbose=None,
+            regroup=False,
+            stream=False,
+            vad=False,
+            failure_threshold=0.3,
+        )
+        if aligned is None:
+            raise RuntimeError("Unable to align the reading fragment")
+        words = [
+            word
+            for segment in aligned.to_dict()["segments"]
+            for word in segment["words"]
+        ]
+        return map_alignment(source, words, len(samples) / rate)
 
 
 def _redact(value: str) -> str:
@@ -208,7 +270,11 @@ def main() -> int:
     def send(message: dict[str, Any]) -> None:
         protocol.write((json.dumps(message, ensure_ascii=True) + "\n").encode())
 
-    worker = StudioWorker(send)
+    def send_audio(message: dict[str, Any], audio: bytes) -> None:
+        send(message)
+        protocol.write(audio)
+
+    worker = StudioWorker(send, send_audio)
     send({"op": "ready"})
     for line in sys.stdin.buffer:
         try:
@@ -220,7 +286,7 @@ def main() -> int:
                 worker.prompt(request)
                 send({"op": "clone", "device": worker.device})
                 continue
-            if request.get("op") != "synthesize":
+            if request.get("op") not in {"synthesize", "synthesize_buffer"}:
                 raise ValueError("Неизвестная команда")
             worker.synthesize(request)
         except Exception as error:  # noqa: BLE001 - Keep model failures inside the protocol boundary.

@@ -1,15 +1,103 @@
 from __future__ import annotations
 
+import io
 import json
 import math
 import shutil
 import subprocess
 from collections.abc import Iterable
+from dataclasses import dataclass
 from pathlib import Path
 from uuid import uuid4
 
 import numpy as np
 import soundfile as sf
+
+from .timeline import WordTime
+
+MAX_AUDIO_BUFFER = 32 * 1024 * 1024
+
+
+@dataclass(frozen=True, slots=True)
+class BufferedSpeech:
+    audio: bytes
+    duration: float
+    words: tuple[WordTime, ...]
+    device: str
+
+
+def render_buffer(
+    samples: np.ndarray,
+    sample_rate: int,
+    *,
+    pause_ms: int = 0,
+    volume_db: float = 0.0,
+    pitch_semitones: float = 0.0,
+    playback_speed: float = 1.0,
+) -> bytes:
+    if not -20 <= volume_db <= 12 or not -6 <= pitch_semitones <= 6:
+        raise ValueError("Invalid audio effect settings")
+    if not 0.5 <= playback_speed <= 3:
+        raise ValueError("Invalid playback speed")
+    data = np.asarray(samples, dtype=np.float32).reshape(-1)
+    if not len(data) or not np.isfinite(data).all() or sample_rate <= 0:
+        raise ValueError("Invalid audio buffer")
+    silence = round(sample_rate * max(0, pause_ms) / 1000)
+    if silence:
+        data = np.concatenate((data, np.zeros(silence, dtype=np.float32)))
+    stream = io.BytesIO()
+    sf.write(stream, data, sample_rate, format="WAV", subtype="PCM_16")
+    audio = stream.getvalue()
+    filters = _effect_filters(volume_db, pitch_semitones, playback_speed)
+    if filters:
+        ffmpeg = shutil.which("ffmpeg")
+        if not ffmpeg:
+            raise RuntimeError("Audio effects require FFmpeg")
+        result = subprocess.run(
+            [
+                ffmpeg,
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-i",
+                "pipe:0",
+                "-af",
+                ",".join(filters),
+                "-ac",
+                "1",
+                "-ar",
+                str(sample_rate),
+                "-codec:a",
+                "pcm_s16le",
+                "-f",
+                "wav",
+                "pipe:1",
+            ],
+            input=audio,
+            capture_output=True,
+            timeout=60,
+            check=True,
+            creationflags=_no_window_flag(),
+        )
+        processed, rate = sf.read(io.BytesIO(result.stdout), dtype="float32")
+        stream = io.BytesIO()
+        sf.write(stream, processed, rate, format="WAV", subtype="PCM_16")
+        audio = stream.getvalue()
+    if len(audio) > MAX_AUDIO_BUFFER:
+        raise ValueError("The reading fragment exceeds the audio buffer limit")
+    return audio
+
+
+def _effect_filters(volume_db: float, pitch: float, speed: float) -> list[str]:
+    filters = []
+    if abs(pitch) > 0.001 or abs(speed - 1.0) > 0.001:
+        ratio = math.pow(2.0, pitch / 12.0)
+        filters.append(f"rubberband=tempo={speed:.6f}:pitch={ratio:.8f}:pitchq=quality")
+    if abs(volume_db) > 0.001:
+        filters.append(f"volume={volume_db:+.2f}dB")
+    if filters:
+        filters.append("alimiter=limit=0.97:level=false:latency=true")
+    return filters
 
 
 def audio_duration(path: str | Path) -> float:
@@ -193,16 +281,7 @@ def _render_output(
             "Для MP3 и обработки звука требуется ffmpeg. Установите ffmpeg."
         )
 
-    filters: list[str] = []
-    if abs(pitch_semitones) > 0.001 or abs(playback_speed - 1.0) > 0.001:
-        pitch_ratio = math.pow(2.0, pitch_semitones / 12.0)
-        filters.append(
-            f"rubberband=tempo={playback_speed:.6f}:pitch={pitch_ratio:.8f}:pitchq=quality"
-        )
-    if abs(volume_db) > 0.001:
-        filters.append(f"volume={volume_db:+.2f}dB")
-    if filters:
-        filters.append("alimiter=limit=0.97:level=false:latency=true")
+    filters = _effect_filters(volume_db, pitch_semitones, playback_speed)
 
     temporary = destination.with_name(
         f"{destination.stem}.{uuid4().hex}.aibook.output.tmp{destination.suffix.lower()}"

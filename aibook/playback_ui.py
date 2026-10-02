@@ -13,6 +13,7 @@ from .alignment import align_audio
 from .editor import edit_group
 from .job import JobCancelled
 from .player import AudioPlayer, PlaybackState, format_time
+from .reading_ui import TextReadingController
 from .timeline import AudioTimeline, ReadingSession, audio_stamp
 from .ui_helpers import icon_button
 
@@ -45,14 +46,30 @@ class PlaybackPanel(ttk.LabelFrame):
         self._pending_play = False
         self._pending_offset: int | None = None
         self._last_save = time.monotonic()
-        self.name = tk.StringVar(value="Аудио не выбрано")
+        self.mode = tk.StringVar(value=saved.get("player_mode", "text"))
+        self.reader = TextReadingController(self)
+        self._last_file: Path | None = None
+        self.name = tk.StringVar(
+            value="Чтение текста" if self.mode.get() == "text" else "Аудио не выбрано"
+        )
         self.clock = tk.StringVar(value="0:00 / 0:00")
         self.position = tk.DoubleVar(value=0.0)
         self.volume = tk.DoubleVar(value=saved.get("player_volume", 0.8))
         self.delete_spoken = tk.BooleanVar(value=saved.get("delete_spoken", False))
         self.columnconfigure(0, weight=1)
-        filename = ttk.Label(self, textvariable=self.name, wraplength=700)
-        filename.grid(row=0, column=0, sticky="ew", padx=(0, 8))
+        heading = ttk.Frame(self)
+        heading.grid(row=0, column=0, sticky="ew", padx=(0, 8))
+        heading.columnconfigure(2, weight=1)
+        for column, (label, value) in enumerate((("Текст", "text"), ("Файл", "file"))):
+            ttk.Radiobutton(
+                heading,
+                text=label,
+                value=value,
+                variable=self.mode,
+                command=self._mode_changed,
+            ).grid(row=0, column=column, padx=(0, 8))
+        filename = ttk.Label(heading, textvariable=self.name, wraplength=700)
+        filename.grid(row=0, column=2, sticky="ew")
         filename.bind(
             "<Configure>",
             lambda event: filename.configure(wraplength=max(100, event.width)),
@@ -115,9 +132,35 @@ class PlaybackPanel(ttk.LabelFrame):
         self._timer = self.after(100, self._poll)
 
     def restore(self, saved: dict) -> None:
+        if self.mode.get() == "text":
+            self.reader.restore(saved.get("reader_state", {}))
+            return
         path = saved.get("player_path", "")
         if path and Path(path).is_file():
             self.load(Path(path), restored=saved)
+
+    def _mode_changed(self) -> None:
+        self.reader.stop()
+        if self._alignment_cancel is not None:
+            self._alignment_cancel.set()
+        self._request += 1
+        self._loading = self._alignment_pending = self._pending_play = False
+        self.player.close()
+        self._state = PlaybackState()
+        self._reading = self._timeline = None
+        self.app.text.tag_remove("read_current", "1.0", "end")
+        self.play_button.configure(state="normal")
+        self.delete_check.configure(state="disabled")
+        self.seek_bar.configure(state="disabled")
+        self.stop_button.configure(state="disabled")
+        if self.mode.get() == "text":
+            self.name.set("Чтение текста")
+            self.reader.restore(self.reader.checkpoint)
+        elif self._last_file is not None and self._last_file.is_file():
+            self.load(self._last_file)
+        else:
+            self.name.set("Аудио не выбрано")
+        self.app._schedule_settings_save()
 
     def choose_audio(self) -> None:
         path = filedialog.askopenfilename(
@@ -133,6 +176,9 @@ class PlaybackPanel(ttk.LabelFrame):
     ) -> None:
         import threading
 
+        self.reader.stop()
+        self.mode.set("file")
+        self._last_file = path
         if self._alignment_cancel is not None:
             self._alignment_cancel.set()
         if not self._loading:
@@ -166,7 +212,7 @@ class PlaybackPanel(ttk.LabelFrame):
         stamp = audio_stamp(path)
         same_audio = stamp == restored.get("player_stamp")
         position = float(restored.get("player_position", 0.0)) if same_audio else 0.0
-        return self.player.load(path, position), timeline, same_audio, stamp
+        return path, position, timeline, same_audio, stamp
 
     def _bind_text(
         self, timeline: AudioTimeline | None, removed: list | None = None
@@ -194,7 +240,8 @@ class PlaybackPanel(ttk.LabelFrame):
         self._loading = False
         self.play_button.configure(state="normal")
         try:
-            state, timeline, same_audio, self._stamp = future.result()
+            path, position, timeline, same_audio, self._stamp = future.result()
+            state = self.player.load(path, position)
             self._state = state
             removed = restored.get("player_removed", []) if same_audio else []
             self._bind_text(timeline, removed)
@@ -262,6 +309,13 @@ class PlaybackPanel(ttk.LabelFrame):
         )
 
     def toggle(self) -> None:
+        if self.mode.get() == "text":
+            try:
+                self.reader.toggle()
+                self.app._schedule_settings_save()
+            except Exception as error:  # noqa: BLE001 - Surface reading preparation errors.
+                self._error(error)
+            return
         if self._loading:
             return
         try:
@@ -303,6 +357,10 @@ class PlaybackPanel(ttk.LabelFrame):
         self._state = self.player.snapshot()
 
     def stop(self) -> None:
+        if self.mode.get() == "text":
+            self.reader.stop()
+            self.app._schedule_settings_save()
+            return
         self._pending_play = False
         try:
             self._consume(self.player.snapshot().position)
@@ -312,6 +370,10 @@ class PlaybackPanel(ttk.LabelFrame):
             self._error(error)
 
     def seek(self, position: float) -> None:
+        if self.mode.get() == "text":
+            self.reader.seek(int(position))
+            self.app._schedule_settings_save()
+            return
         self._pending_play = False
         state = self.player.snapshot()
         self._consume(state.position)
@@ -322,6 +384,12 @@ class PlaybackPanel(ttk.LabelFrame):
         self.app._schedule_settings_save()
 
     def _begin_seek(self, _event) -> None:
+        if self.mode.get() == "text":
+            self._seeking = True
+            self._resume_seek = self.reader._intent
+            self._consume(self.player.snapshot().position)
+            self.player.pause()
+            return
         if self._loading or self._state.path is None:
             return
         self._seeking = True
@@ -333,7 +401,7 @@ class PlaybackPanel(ttk.LabelFrame):
             return
         try:
             self.seek(self.position.get())
-            if self._resume_seek:
+            if self._resume_seek and self.mode.get() != "text":
                 self.player.play()
         except Exception as error:  # noqa: BLE001 - Contain native playback failures at the UI boundary.
             self._error(error)
@@ -376,6 +444,10 @@ class PlaybackPanel(ttk.LabelFrame):
             return
         if self.app.text.get("1.0", "end-1c") == self._reading.remaining_text():
             return
+        if self.mode.get() == "text":
+            self.reader.stop(forget=True)
+            self.delete_spoken.set(False)
+            return
         if self.delete_spoken.get():
             self.player.pause()
             self.delete_spoken.set(False)
@@ -393,21 +465,38 @@ class PlaybackPanel(ttk.LabelFrame):
             parent=self,
         ):
             return
+        timeline = self._timeline
+        if self.mode.get() == "text":
+            self.reader.stop(forget=True)
         self.player.pause()
         self._editing = True
         try:
             with edit_group(self.app.text):
                 self.app.text.delete("1.0", "end")
-                self.app.text.insert("1.0", self._timeline.source)
+                self.app.text.insert("1.0", timeline.source)
             self.app._on_text_modified()
-            self._bind_text(self._timeline)
+            self._bind_text(timeline)
             self._delete_cursor = self.player.snapshot().position
         finally:
             self._editing = False
 
     def settings(self) -> dict:
+        if self.mode.get() == "text":
+            return {
+                "player_mode": "text",
+                "reader_state": self.reader.save_checkpoint(),
+                "player_path": "",
+                "player_position": 0.0,
+                "player_removed": [],
+                "player_stamp": "",
+                "player_run_start": 0.0,
+                "delete_spoken": self.delete_spoken.get(),
+                "player_volume": self.volume.get(),
+            }
         state = self._state if self._closed or self._loading else self.player.snapshot()
         return {
+            "player_mode": "file",
+            "reader_state": {},
             "player_path": str(state.path) if state.path else "",
             "player_position": state.position,
             "player_run_start": self._run_start,
@@ -425,13 +514,26 @@ class PlaybackPanel(ttk.LabelFrame):
                 kind, token, payload = self.events.get_nowait()
             except queue.Empty:
                 break
+            if kind in {"read_ready", "read_status"}:
+                self.reader.handle(kind, token, payload)
+                continue
             if token != self._request:
                 continue
             if kind == "load":
                 self._finish_load(*payload)
             elif kind == "align":
                 self._finish_alignment(payload)
-        if not self._loading and not self._seeking:
+        if self.mode.get() == "text":
+            try:
+                if not self._seeking:
+                    self.reader.poll()
+                if self.reader.active and time.monotonic() - self._last_save > 1.5:
+                    self._last_save = time.monotonic()
+                    self.app._queue_settings_save()
+            except Exception as error:  # noqa: BLE001 - Contain native memory-playback failures.
+                self.reader.stop()
+                self._error(error, modal=False)
+        elif not self._loading and not self._seeking:
             try:
                 was_playing = self._state.playing
                 self._state = self.player.snapshot()
@@ -470,24 +572,23 @@ class PlaybackPanel(ttk.LabelFrame):
                 self.clock.set(
                     f"{format_time(state.position)} / {format_time(state.duration)}"
                 )
-                image = "pause" if state.playing else "play"
-                if getattr(self, "_button_image", None) != image:
-                    if hasattr(self.play_button, "image"):
-                        self.play_button.image.configure(
-                            file=str(
-                                Path(__file__).parent
-                                / "assets"
-                                / "icons"
-                                / f"{image}.png"
-                            )
-                        )
-                    self._button_image = image
+                self._update_play_icon("pause" if state.playing else "play")
                 if state.playing and time.monotonic() - self._last_save > 1.5:
                     self._last_save = time.monotonic()
                     self.app._queue_settings_save()
             except Exception as error:  # noqa: BLE001 - Do not let a decoder failure stop UI event processing.
                 self._error(error, modal=False)
         self._timer = self.after(100, self._poll)
+
+    def _update_play_icon(self, image: str) -> None:
+        if getattr(self, "_button_image", None) != image:
+            if hasattr(self.play_button, "image"):
+                self.play_button.image.configure(
+                    file=str(
+                        Path(__file__).parent / "assets" / "icons" / f"{image}.png"
+                    )
+                )
+            self._button_image = image
 
     def _error(self, error: Exception, *, modal: bool = True) -> None:
         logger.error(
@@ -503,6 +604,7 @@ class PlaybackPanel(ttk.LabelFrame):
             return
         self._closed = True
         self.after_cancel(self._timer)
+        self.reader.close()
         if self._alignment_cancel is not None:
             self._alignment_cancel.set()
         self.pool.shutdown(wait=True, cancel_futures=True)

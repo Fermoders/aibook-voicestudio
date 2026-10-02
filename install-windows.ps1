@@ -12,7 +12,7 @@ param(
 
 $ErrorActionPreference = "Stop"
 $repository = "Fermoders/aibook-voicestudio"
-$version = "1.1.0"
+$version = "1.2.0"
 $releaseBase = "https://github.com/$repository/releases/download/v$version"
 $application = "AIBookVoiceStudio"
 $gib = [int64]1073741824
@@ -356,7 +356,7 @@ try {
     [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
     $http = [Net.Http.HttpClient]::new()
     $http.Timeout = [TimeSpan]::FromHours(3)
-    $http.DefaultRequestHeaders.UserAgent.ParseAdd('AIBookVoiceStudio-Installer/1.1.0')
+    $http.DefaultRequestHeaders.UserAgent.ParseAdd('AIBookVoiceStudio-Installer/1.2.0')
     [void][IO.Directory]::CreateDirectory($cache)
     if ($ManifestPath) {
         $manifestFile = [IO.Path]::GetFullPath($ManifestPath)

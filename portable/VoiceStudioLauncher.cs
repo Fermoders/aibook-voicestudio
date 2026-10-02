@@ -10,7 +10,7 @@ using System.Windows.Forms;
 
 [assembly: AssemblyTitle("AIBook VoiceStudio")]
 [assembly: AssemblyDescription("Standalone local audiobook narration")]
-[assembly: AssemblyVersion("1.1.0.0")]
+[assembly: AssemblyVersion("1.2.0.0")]
 
 internal static class VoiceStudioLauncher
 {

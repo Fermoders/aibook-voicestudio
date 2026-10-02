@@ -18,6 +18,7 @@ class PlaybackState:
     duration: float = 0.0
     position: float = 0.0
     playing: bool = False
+    buffered: bool = False
 
 
 class AudioPlayer:
@@ -33,6 +34,7 @@ class AudioPlayer:
         self._device = None
         self._stream = None
         self._path: Path | None = None
+        self._buffer = None
         self._duration = self._position = self._offset = 0.0
         self._playing = self._eof = False
         self._submitted = 0
@@ -57,6 +59,29 @@ class AudioPlayer:
                 self._position = min(duration, max(0.0, float(position)))
             return self.snapshot()
 
+    def load_buffer(self, audio: bytes, position: float = 0.0) -> PlaybackState:
+        import miniaudio
+
+        from .audio import MAX_AUDIO_BUFFER
+
+        if not audio or len(audio) > MAX_AUDIO_BUFFER:
+            raise ValueError("Invalid audio buffer size")
+        decoded = miniaudio.decode(
+            audio,
+            output_format=miniaudio.SampleFormat.FLOAT32,
+            nchannels=1,
+            sample_rate=self.SAMPLE_RATE,
+        )
+        if not decoded.num_frames:
+            raise ValueError("Audio buffer is empty")
+        with self._control_lock:
+            self.close()
+            with self._state_lock:
+                self._buffer = decoded.samples
+                self._duration = decoded.num_frames / self.SAMPLE_RATE
+                self._position = min(self._duration, max(0.0, float(position)))
+            return self.snapshot()
+
     def snapshot(self) -> PlaybackState:
         with self._state_lock:
             if self._error is not None:
@@ -77,7 +102,13 @@ class AudioPlayer:
                         self._duration,
                         self._offset + self._submitted / self.SAMPLE_RATE,
                     )
-            return PlaybackState(self._path, self._duration, position, self._playing)
+            return PlaybackState(
+                self._path,
+                self._duration,
+                position,
+                self._playing,
+                self._buffer is not None,
+            )
 
     def _halt(self) -> None:
         try:
@@ -85,7 +116,12 @@ class AudioPlayer:
         except RuntimeError:
             logger.exception("Stopping playback after a decoder failure")
             with self._state_lock:
-                state = PlaybackState(self._path, self._duration, self._position)
+                state = PlaybackState(
+                    self._path,
+                    self._duration,
+                    self._position,
+                    buffered=self._buffer is not None,
+                )
         # ma_device_stop waits for its callback; never hold _state_lock here.
         if self._device is not None:
             self._device.stop()
@@ -103,7 +139,7 @@ class AudioPlayer:
         with self._control_lock:
             self._halt()
             state = self.snapshot()
-            if state.path is None:
+            if state.path is None and self._buffer is None:
                 raise ValueError("Сначала выберите аудиофайл")
             if self._device is None:
                 try:
@@ -118,13 +154,22 @@ class AudioPlayer:
                         "Не найдено доступное звуковое устройство. Проверьте аудиовыход Windows."
                     ) from error
             position = 0.0 if state.position >= self._duration - 0.1 else state.position
-            decoder = miniaudio.stream_file(
-                str(state.path),
-                output_format=miniaudio.SampleFormat.FLOAT32,
-                nchannels=1,
-                sample_rate=self.SAMPLE_RATE,
-                seek_frame=round(position * self.SAMPLE_RATE),
-            )
+            frame = round(position * self.SAMPLE_RATE)
+            if self._buffer is not None:
+                # A float memoryview indexes samples, not bytes.
+                decoder = miniaudio.stream_raw_pcm_memory(
+                    memoryview(self._buffer)[frame:],
+                    nchannels=1,
+                    sample_width=1,
+                )
+            else:
+                decoder = miniaudio.stream_file(
+                    str(state.path),
+                    output_format=miniaudio.SampleFormat.FLOAT32,
+                    nchannels=1,
+                    sample_rate=self.SAMPLE_RATE,
+                    seek_frame=frame,
+                )
             with self._state_lock:
                 self._offset = self._position = position
                 self._submitted = 0
@@ -202,6 +247,7 @@ class AudioPlayer:
                     self._device = None
                 with self._state_lock:
                     self._path = None
+                    self._buffer = None
                     self._duration = self._position = 0.0
 
 

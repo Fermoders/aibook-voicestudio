@@ -33,6 +33,8 @@ def default_settings() -> dict[str, Any]:
         "volume_db": 0.0,
         "saved_voice_id": "",
         "player_path": "",
+        "player_mode": "text",
+        "reader_state": {},
         "player_position": 0.0,
         "player_run_start": 0.0,
         "player_stamp": "",
@@ -66,6 +68,8 @@ class SettingsStore:
                     if isinstance(restored.get(key), str) and restored[key]:
                         restored[key] = str(decode_portable_path(restored[key]))
                 settings.update(restored)
+                if "player_mode" not in payload and settings["player_path"]:
+                    settings["player_mode"] = "file"
             return settings
 
     def load_draft(self) -> str:

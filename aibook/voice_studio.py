@@ -12,6 +12,7 @@ import time
 from pathlib import Path
 from typing import Any
 
+from .audio import MAX_AUDIO_BUFFER, BufferedSpeech
 from .config import app_data_dir
 from .engine import StatusCallback, VoiceSpec
 from .voice_library import cached_prompt_path
@@ -132,6 +133,47 @@ class VoiceStudioEngine:
         }
         result = self._exchange(request, "audio", status, cancel_event)
         return str(result["device"])
+
+    def synthesize_buffer(
+        self,
+        *,
+        text: str,
+        voice: VoiceSpec,
+        device_preference: str,
+        speed: float,
+        seed: int,
+        num_steps: int,
+        status: StatusCallback,
+        cancel_event: threading.Event,
+        pitch_semitones: float = 0.0,
+        volume_db: float = 0.0,
+        playback_speed: float = 1.0,
+        pause_ms: int = 0,
+    ) -> BufferedSpeech:
+        from .timeline import WordTime
+
+        if not 4 <= num_steps <= 64 or not 0.7 <= speed <= 3:
+            raise ValueError("Invalid synthesis parameters")
+        request = {
+            "op": "synthesize_buffer",
+            "text": text,
+            **self._voice_request(voice),
+            "device": device_preference,
+            "speed": speed,
+            "seed": seed,
+            "num_steps": num_steps,
+            "pitch_semitones": pitch_semitones,
+            "volume_db": volume_db,
+            "playback_speed": playback_speed,
+            "pause_ms": pause_ms,
+        }
+        result = self._exchange(request, "audio_buffer", status, cancel_event)
+        return BufferedSpeech(
+            result["payload"],
+            float(result["duration"]),
+            tuple(WordTime(**word) for word in result["words"]),
+            str(result["device"]),
+        )
 
     def _exchange(
         self,
@@ -287,12 +329,20 @@ class VoiceStudioEngine:
 
 def _read_messages(stream: Any, messages: queue.Queue[dict[str, Any]]) -> None:
     try:
-        for line in stream:
+        while line := stream.readline(65537):
             if len(line) > 65536:
                 raise ValueError("Слишком большое сообщение движка")
             value = json.loads(line)
             if not isinstance(value, dict):
                 raise TypeError("Некорректное сообщение движка")
+            if value.get("op") == "audio_buffer":
+                size = value.get("size")
+                if type(size) is not int or not 0 < size <= MAX_AUDIO_BUFFER:
+                    raise ValueError("Invalid audio frame size")
+                payload = stream.read(size)
+                if len(payload) != size:
+                    raise ValueError("Truncated audio frame")
+                value["payload"] = payload
             messages.put(value)
     except (OSError, ValueError, TypeError) as error:
         messages.put(

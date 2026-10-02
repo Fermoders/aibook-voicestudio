@@ -139,7 +139,9 @@ class AIBookApp:
         style.configure("Tool.TButton", padding=(5, 3))
 
     def _build_ui(self) -> None:
-        container = ttk.Frame(self.root, padding=10 if self.profile.voice_studio else 14)
+        container = ttk.Frame(
+            self.root, padding=10 if self.profile.voice_studio else 14
+        )
         container.pack(fill="both", expand=True)
         container.columnconfigure(0, weight=1)
         container.columnconfigure(1, weight=0, minsize=290)
@@ -416,7 +418,7 @@ class AIBookApp:
         actions.columnconfigure(2, weight=1)
         self.start_button = ttk.Button(
             actions,
-            text="Начать озвучку",
+            text="Сохранить аудио" if self.profile.voice_studio else "Начать озвучку",
             style="Primary.TButton",
             command=self._start_synthesis,
         )
@@ -553,10 +555,50 @@ class AIBookApp:
                 button.configure(state="normal" if saved and not busy else "disabled")
 
     def _synthesis_busy(self) -> bool:
+        panel = getattr(self, "player_panel", None)
+        return self._model_jobs_busy() or (panel is not None and panel.reader.active)
+
+    def _model_jobs_busy(self) -> bool:
         return any(
             future is not None and not future.done()
             for future in (self.job_future, self.clone_future)
         )
+
+    def reading_options(self):
+        from .buffered_reading import ReadingOptions
+
+        options = ReadingOptions(
+            voice=self._voice_spec(),
+            device=self.device.get(),
+            max_chars=int(self.max_chars.get()),
+            speed=float(self.speed.get()),
+            playback_speed=float(self.playback_speed.get()),
+            pitch_semitones=float(self.pitch_semitones.get()),
+            volume_db=float(self.volume_db.get()),
+            seed=int(self.seed.get()),
+            num_steps=int(self.num_steps.get()),
+        )
+        options.validate()
+        return options
+
+    def prepare_reading_voice(
+        self, voice: VoiceSpec, device: str, cancel: threading.Event
+    ) -> VoiceSpec:
+        path = self.engine.create_voice(
+            voice,
+            device,
+            lambda message: self.events.put(("voice_progress", message)),
+            cancel,
+        )
+        if cancel.is_set():
+            raise JobCancelled("Reading stopped")
+        entry = self.voice_library.add(
+            path, voice.reference_audio.stem[:70], unique_name=True
+        )
+        self.events.put(
+            ("voice_saved", (entry, (str(voice.reference_audio), voice.reference_text)))
+        )
+        return VoiceSpec(saved_prompt=self.voice_library.path(entry.id))
 
     def _selected_saved_voice(self) -> SavedVoice | None:
         return self._saved_voices.get(self.speaker.get())
@@ -909,6 +951,10 @@ class AIBookApp:
         return self.job.run(text, options, cancel, progress)
 
     def _stop_synthesis(self) -> None:
+        if self.profile.voice_studio and self.player_panel.reader.active:
+            self.player_panel.reader.stop()
+            self.status.set("Чтение остановлено")
+            return
         self.cancel_event.set()
         self.stop_button.configure(state="disabled")
         self.status.set(
@@ -1070,15 +1116,18 @@ class AIBookApp:
         self.last_output = result
         self._refresh_history(self.history_store.add(result))
         self.open_button.configure(state="normal")
-        self.status.set(f"Готово: {result.name if self.profile.voice_studio else result}")
+        self.status.set(
+            f"Готово: {result.name if self.profile.voice_studio else result}"
+        )
         if self.profile.voice_studio:
-            self.player_panel.load(result, autoplay=self._play_after_job)
+            if self.player_panel.mode.get() == "file" or self._play_after_job:
+                self.player_panel.load(result, autoplay=self._play_after_job)
             self._play_after_job = False
 
     def _on_close(self) -> None:
         if self._closing:
             return
-        if self._synthesis_busy():
+        if self._model_jobs_busy():
             if not messagebox.askyesno(
                 "Остановить озвучку?",
                 "Готовые фрагменты останутся в кэше для продолжения.",

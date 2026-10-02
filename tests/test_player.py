@@ -8,6 +8,7 @@ from pathlib import Path
 
 import numpy as np
 import soundfile as sf
+from unittest.mock import patch
 
 from aibook.player import AudioPlayer, format_time
 
@@ -53,6 +54,37 @@ class PlayerTests(unittest.TestCase):
         self.player.play()
         time.sleep(0.2)
         self.assertGreater(self.player.snapshot().position, 1.05)
+
+    def test_buffer_playback_does_not_require_an_audio_file(self) -> None:
+        audio = self.path.read_bytes()
+        self.path.unlink()
+        state = self.player.load_buffer(audio)
+        self.assertTrue(state.buffered)
+        self.assertIsNone(state.path)
+        with patch(
+            "miniaudio.stream_file", side_effect=AssertionError("File playback used")
+        ):
+            self.player.play()
+            time.sleep(0.25)
+            self.assertGreater(self.player.snapshot().position, 0.1)
+            self.player.pause()
+            self.player.seek(1.0)
+            self.player.play()
+            time.sleep(0.2)
+            self.assertGreater(self.player.snapshot().position, 1.05)
+        self.player.close()
+        self.assertIsNone(self.player._buffer)
+
+    def test_concurrent_buffer_controls_do_not_deadlock(self) -> None:
+        self.player.load_buffer(self.path.read_bytes())
+        self.player.play()
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            futures = [
+                pool.submit(self.player.seek, (index % 4) / 4) for index in range(12)
+            ]
+            for future in futures:
+                future.result(timeout=5)
+        self.assertTrue(self.player.snapshot().buffered)
 
     def test_concurrent_controls_do_not_deadlock_the_audio_callback(self) -> None:
         self.player.load(self.path)

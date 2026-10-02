@@ -206,6 +206,7 @@ def main() -> None:
             )
 
             app.output_format.set("mp3")
+            app.player_panel.mode.set("file")
             app.playback_speed.set(1.2)
             app.pitch_semitones.set(-0.5)
             app.volume_db.set(1)
