@@ -48,6 +48,54 @@ function Test-VerifiedFile {
         (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash -eq $Sha256
 }
 
+function Get-PendingDownloadBytes {
+    param($Manifest, [string]$Root)
+    $pending = 0L
+    foreach ($asset in $Manifest.assets) {
+        $path = Get-SafeChildPath $Root $asset.name
+        if (Test-VerifiedFile $path $asset.size $asset.sha256) { continue }
+        $partialBytes = 0L
+        if (Test-Path -LiteralPath ($path + '.part') -PathType Leaf) {
+            $partialBytes = [math]::Min([int64]$asset.size, (Get-Item -LiteralPath ($path + '.part')).Length)
+        }
+        $pending += [int64]$asset.size - $partialBytes
+    }
+    return $pending
+}
+
+function Move-InstallDirectory {
+    param([string]$Source, [string]$Destination, [ValidateRange(1, 30)][int]$Attempts = 30)
+    $from = [IO.Path]::GetFullPath($Source).TrimEnd('\')
+    $to = [IO.Path]::GetFullPath($Destination).TrimEnd('\')
+    if ($from -notmatch '^[A-Za-z]:\\' -or $to -notmatch '^[A-Za-z]:\\' -or
+        $from -eq [IO.Path]::GetPathRoot($from).TrimEnd('\') -or
+        $to -eq [IO.Path]::GetPathRoot($to).TrimEnd('\') -or
+        [IO.Path]::GetPathRoot($from) -ne [IO.Path]::GetPathRoot($to) -or
+        $from -eq $to -or $to.StartsWith($from + '\', [StringComparison]::OrdinalIgnoreCase) -or
+        $from.StartsWith($to + '\', [StringComparison]::OrdinalIgnoreCase)) {
+        throw 'Installation directories must be distinct local folders on the same drive.'
+    }
+    for ($attempt = 1; $attempt -le $Attempts; $attempt++) {
+        if ([IO.Directory]::Exists($to) -or [IO.File]::Exists($to)) {
+            throw "Installation destination already exists; it was preserved: $to"
+        }
+        try {
+            # Do not let Move-Item fall back to a partial copy/delete on Windows.
+            [IO.Directory]::Move($from, $to)
+            return
+        } catch {
+            $failure = $_.Exception
+            while ($failure.InnerException) { $failure = $failure.InnerException }
+            $code = $failure.HResult -band 0xffff
+            if ($code -notin @(5, 32, 33) -or $attempt -eq $Attempts) {
+                throw [IO.IOException]::new("Cannot rename installation folder '$from' to '$to' (Windows error $code). Close programs using these folders and retry. Downloaded files were retained; folder permissions were not changed.", $failure)
+            }
+            Write-Host "Windows has not released the installation folder (error $code); retry $attempt of $Attempts."
+            Start-Sleep -Milliseconds ([int][math]::Min(2000, 250 * [math]::Pow(2, $attempt - 1)))
+        }
+    }
+}
+
 function Get-RemoteFile {
     param([string]$Uri, [string]$Path, [int64]$Size = 0, [string]$Sha256 = "")
     if ($Size -gt 0 -and (Test-VerifiedFile $Path $Size $Sha256)) { return }
@@ -343,7 +391,8 @@ try {
     $installDrive = [IO.DriveInfo]::new([IO.Path]::GetPathRoot($target))
     $cacheDrive = [IO.DriveInfo]::new([IO.Path]::GetPathRoot($cache))
     $sameDrive = $installDrive.Name -eq $cacheDrive.Name
-    if ($defaultCache -and $sameDrive -and $installDrive.AvailableFreeSpace -lt ($manifest.installed_bytes + $manifest.download_bytes + $gib)) {
+    $pendingDownloadBytes = Get-PendingDownloadBytes $manifest $cache
+    if ($defaultCache -and $sameDrive -and $installDrive.AvailableFreeSpace -lt ($manifest.installed_bytes + $pendingDownloadBytes + $gib)) {
         $other = @([IO.DriveInfo]::GetDrives() | Where-Object {
             $_.DriveType -eq 'Fixed' -and $_.IsReady -and $_.Name -ne $installDrive.Name -and $_.AvailableFreeSpace -gt ($manifest.download_bytes + $gib)
         } | Sort-Object AvailableFreeSpace -Descending | Select-Object -First 1)
@@ -353,11 +402,12 @@ try {
             Write-Host "Using a download cache on another drive: $cache"
             $cacheDrive = $other[0]
             $sameDrive = $false
+            $pendingDownloadBytes = Get-PendingDownloadBytes $manifest $cache
         }
     }
     $installRequired = [int64]$manifest.installed_bytes + $gib
-    $cacheRequired = [int64]$manifest.download_bytes + $gib
-    if ($sameDrive) { $installRequired += [int64]$manifest.download_bytes }
+    $cacheRequired = $pendingDownloadBytes + $gib
+    if ($sameDrive) { $installRequired += $pendingDownloadBytes }
     if ($installDrive.AvailableFreeSpace -lt $installRequired -or (-not $sameDrive -and $cacheDrive.AvailableFreeSpace -lt $cacheRequired)) {
         throw 'Not enough disk space. Choose -InstallDir and -CacheDir on a drive with at least 20 GiB free.'
     }
@@ -383,14 +433,14 @@ try {
             if (Test-Path -LiteralPath $source) {
                 $destination = Get-SafeChildPath $stage $relative
                 [void][IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($destination))
-                Move-Item -LiteralPath $source -Destination $destination
+                Move-InstallDirectory $source $destination
                 $movedData += $relative
             }
         }
         $backup = Join-Path $parent ([IO.Path]::GetFileName($target) + '.previous-' + [Guid]::NewGuid().ToString('N').Substring(0, 8))
-        Move-Item -LiteralPath $target -Destination $backup
+        Move-InstallDirectory $target $backup
     }
-    Move-Item -LiteralPath $stage -Destination $target
+    Move-InstallDirectory $stage $target
     $published = $true
     $stage = $null
     Set-ApplicationShortcut $target
@@ -409,14 +459,14 @@ try {
     try {
         if (-not $published -and $stage) {
             if ($backup -and (Test-Path -LiteralPath $backup) -and -not (Test-Path -LiteralPath $target)) {
-                Move-Item -LiteralPath $backup -Destination $target
+                Move-InstallDirectory $backup $target
             }
             foreach ($relative in $movedData) {
                 $source = Get-SafeChildPath $stage $relative
                 if (Test-Path -LiteralPath $source) {
                     $destination = Get-SafeChildPath $target $relative
                     [void][IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($destination))
-                    Move-Item -LiteralPath $source -Destination $destination
+                    Move-InstallDirectory $source $destination
                 }
             }
             $resolvedStage = [IO.Path]::GetFullPath($stage)

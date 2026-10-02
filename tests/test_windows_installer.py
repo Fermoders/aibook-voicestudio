@@ -13,6 +13,25 @@ from pathlib import Path
 
 INSTALLER = Path(__file__).resolve().parent.parent / "install-windows.ps1"
 POWERSHELL = Path(os.environ.get("WINDIR", "C:/Windows")) / "System32/WindowsPowerShell/v1.0/powershell.exe"
+DIRECTORY_LOCK_SOURCE = """
+using System;
+using System.Runtime.InteropServices;
+using Microsoft.Win32.SafeHandles;
+public static class InstallerDirectoryLock {
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    public static extern SafeFileHandle CreateFileW(string path, uint access,
+        uint share, IntPtr security, uint creation, uint flags, IntPtr template);
+    public static SafeFileHandle Open(string path) {
+        SafeFileHandle handle = CreateFileW(path, 0x80000000, 3, IntPtr.Zero, 3, 0x02000000, IntPtr.Zero);
+        if (handle.IsInvalid) {
+            int error = Marshal.GetLastWin32Error();
+            handle.Dispose();
+            throw new System.ComponentModel.Win32Exception(error);
+        }
+        return handle;
+    }
+}
+"""
 
 
 def ps_literal(value):
@@ -65,6 +84,99 @@ class WindowsInstallerTests(unittest.TestCase):
             f"$path = {ps_literal(path)}; "
             f"if (-not (Test-VerifiedFile $path 5 '{digest}')) {{ throw 'Valid asset rejected' }}; "
             f"if (Test-VerifiedFile $path 5 ('0' * 64)) {{ throw 'Corrupt asset accepted' }}"
+        )
+
+    def test_locked_directory_retries_native_rename_without_partial_copy(self):
+        source = self.root / "stage"
+        source.mkdir()
+        (source / "retained.txt").write_bytes(b"retained")
+        target = self.root / "installed"
+        self.run_functions(
+            f"Add-Type -TypeDefinition {ps_literal(DIRECTORY_LOCK_SOURCE)}; "
+            f"$script:handle = [InstallerDirectoryLock]::Open({ps_literal(source)}); "
+            "$script:sleeps = 0; "
+            "function Start-Sleep { param([int]$Milliseconds) "
+            "$script:sleeps++; "
+            f"if (Test-Path -LiteralPath {ps_literal(target)}) {{ throw 'Rename created a partial target' }}; "
+            "$script:handle.Dispose() }; "
+            f"try {{ Move-InstallDirectory {ps_literal(source)} {ps_literal(target)} -Attempts 3; "
+            "if ($script:sleeps -ne 1) { throw 'The native Windows lock was not retried' } } "
+            "finally { $script:handle.Dispose() }"
+        )
+        self.assertFalse(source.exists())
+        self.assertEqual((target / "retained.txt").read_bytes(), b"retained")
+
+    def test_native_lock_reproduces_the_reported_move_item_ioerror(self):
+        source = self.root / "stage"
+        source.mkdir()
+        target = self.root / "installed"
+        self.run_functions(
+            f"Add-Type -TypeDefinition {ps_literal(DIRECTORY_LOCK_SOURCE)}; "
+            f"$handle = [InstallerDirectoryLock]::Open({ps_literal(source)}); "
+            "$rejected = $false; "
+            f"try {{ Move-Item -LiteralPath {ps_literal(source)} -Destination {ps_literal(target)} }} "
+            "catch { $rejected = $true; if ($_.FullyQualifiedErrorId -notmatch 'MoveDirectoryItemIOError') { throw } } "
+            "finally { $handle.Dispose() }; "
+            "if (-not $rejected) { throw 'The reported Move-Item failure was not reproduced' }"
+        )
+
+    def test_persistent_directory_lock_is_bounded_and_preserves_source(self):
+        source = self.root / "stage"
+        source.mkdir()
+        (source / "retained.txt").write_bytes(b"retained")
+        target = self.root / "installed"
+        self.run_functions(
+            f"Add-Type -TypeDefinition {ps_literal(DIRECTORY_LOCK_SOURCE)}; "
+            f"$handle = [InstallerDirectoryLock]::Open({ps_literal(source)}); "
+            "$script:sleeps = 0; function Start-Sleep { param([int]$Milliseconds) $script:sleeps++ }; "
+            "$rejected = $false; "
+            f"try {{ Move-InstallDirectory {ps_literal(source)} {ps_literal(target)} -Attempts 3 }} "
+            "catch { $rejected = $true; if ($_.Exception.ToString() -notmatch 'Windows error (5|32|33)') { throw } } "
+            "finally { $handle.Dispose() }; "
+            "if (-not $rejected -or $script:sleeps -ne 2) { throw 'Persistent lock was not bounded' }"
+        )
+        self.assertEqual((source / "retained.txt").read_bytes(), b"retained")
+        self.assertFalse(target.exists())
+
+    def test_directory_move_does_not_nest_inside_an_existing_destination(self):
+        source, target = self.root / "stage", self.root / "installed"
+        source.mkdir()
+        target.mkdir()
+        (source / "source.txt").write_bytes(b"source")
+        (target / "original.txt").write_bytes(b"original")
+        self.run_functions(
+            "$rejected = $false; "
+            f"try {{ Move-InstallDirectory {ps_literal(source)} {ps_literal(target)} }} "
+            "catch { $rejected = $true }; if (-not $rejected) { throw 'Existing destination accepted' }"
+        )
+        self.assertEqual((source / "source.txt").read_bytes(), b"source")
+        self.assertEqual(list(target.iterdir()), [target / "original.txt"])
+
+    def test_directory_move_rejects_unsafe_roots_and_nested_targets(self):
+        source = self.root / "stage"
+        source.mkdir()
+        self.run_functions(
+            f"$source = {ps_literal(source)}; $drive = [IO.Path]::GetPathRoot($source); "
+            "$rejected = 0; foreach ($destination in @($drive, $source, (Join-Path $source 'child'))) { "
+            "try { Move-InstallDirectory $source $destination } catch { $rejected++ } }; "
+            "if ($rejected -ne 3) { throw 'Unsafe move accepted' }"
+        )
+        self.assertTrue(source.exists())
+
+    def test_pending_download_space_discounts_only_verified_assets_and_partials(self):
+        cached = self.root / "cached.zip"
+        cached.write_bytes(b"valid")
+        corrupt = self.root / "corrupt.zip"
+        corrupt.write_bytes(b"wrong")
+        (self.root / "partial.bin.part").write_bytes(b"ab")
+        manifest = {"assets": [
+            {"name": path.name, "size": 5, "sha256": hashlib.sha256(b"valid").hexdigest()}
+            for path in (cached, corrupt, self.root / "missing.bin", self.root / "partial.bin")
+        ]}
+        self.run_functions(
+            f"$manifest = {ps_literal(json.dumps(manifest))} | ConvertFrom-Json; "
+            f"$pending = Get-PendingDownloadBytes $manifest {ps_literal(self.root)}; "
+            "if ($pending -ne 13) { throw \"Incorrect pending download space: $pending\" }"
         )
 
     def test_archive_cannot_write_outside_the_staging_directory(self):
