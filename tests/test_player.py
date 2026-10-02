@@ -5,10 +5,10 @@ import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from unittest.mock import patch
 
 import numpy as np
 import soundfile as sf
-from unittest.mock import patch
 
 from aibook.player import AudioPlayer, format_time
 

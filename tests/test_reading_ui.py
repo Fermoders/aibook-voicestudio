@@ -12,12 +12,12 @@ from pathlib import Path
 from unittest.mock import patch
 
 import soundfile as sf
+from test_buffered_reading import SOURCE, BufferEngine
+from test_playback_ui import FakePlayer
 
 from aibook.app import AIBookApp
 from aibook.player import PlaybackState
 from aibook.settings import SettingsStore
-from test_buffered_reading import SOURCE, BufferEngine
-from test_playback_ui import FakePlayer
 from voice_studio_main import studio_profile
 
 

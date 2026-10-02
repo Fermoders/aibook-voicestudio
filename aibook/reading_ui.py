@@ -37,7 +37,7 @@ class TextReadingController:
         try:
             source = checkpoint["source"]
             if not isinstance(source, str):
-                raise ValueError("Invalid reading source")
+                raise TypeError("Invalid reading source")
             ReadingOptions.restore(checkpoint["options"])
             reading = ReadingSession(
                 AudioTimeline(source, "memory"), checkpoint["removed"]
